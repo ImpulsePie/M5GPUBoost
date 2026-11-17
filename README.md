@@ -1,136 +1,129 @@
-# M5 Scroll Boost
+# M5GPUBoost
 
-Current version: **1.0 (experimental)**.
+Current version: **1.0.0**
 
-An experimental macOS menu-bar workaround for scrolling stutter on external
-5K displays at high refresh rates. It submits repeated short Metal workloads
-while scrolling. It does not directly set GPU
-clocks or make permanent system changes.
+This is my fork of Frederic Bossy's
+[M5ScrollBoost](https://github.com/fwedbo/M5ScrollBoost). It's a little
+menu-bar app that keeps the GPU ticking over with tiny Metal workloads, so
+the desktop stays smooth on a big high-refresh external display. It doesn't
+touch GPU clocks or system settings.
 
-This project grew out of testing an M5 Pro MacBook Pro with an Apple Studio
-Display XDR at 5120 × 2880 and fixed 120 Hz. Improvement depends on the workload
-and system; this is not a guaranteed fix or an Apple-supported utility.
-The app does **not** check that the processor is an M5.
+Fred's version boosts while you scroll. I wanted the whole desktop smooth on
+my 5K2K ultrawide, so I added a few more modes and a lighter Metal 4 backend.
 
-## Requirements
+## What I changed
 
-- Apple silicon Mac; macOS 26 or 27; the build script targets arm64 with macOS 26 as its minimum.
-- Apple's Command Line Tools or Xcode with the Swift compiler.
-- AC power and a qualifying external display: at least 5000 × 2800 pixels and
-  a reported refresh rate of 100 Hz or more. Studio Display XDR also qualifies
-  when CoreGraphics reports 0 Hz (unknown/adaptive). A reported 60 Hz does not
-  qualify, even for that display name.
+- **5K2K ultrawides work now.** The minimum is 5000 × 2000 pixels instead of
+  5000 × 2800, still at 100 Hz or more.
+- **New modes:** On activity, While in use and Always while docked.
+- **Metal 4 backend for Gentle.** It reuses three command buffers instead of
+  making a new one every time. Balanced still uses Fred's original engine,
+  which is also the fallback. More detail in the
+  [GPU scheduling notes](docs/GPU-SCHEDULING.md).
+- **Three-second lease.** The GPU loop stops by itself unless the app keeps
+  renewing it, so it can't get stuck running.
+- **Pauses on screen lock** too, not just battery, display sleep and thermal
+  pressure. It lets go of everything while it's paused.
+- **The menu icon disappears** when there's no qualifying display plugged in.
+- **Fewer menu-bar redraws.**
 
-The deployment target is not a claim that performance has been tested on
-every supported macOS version, Mac, or display. See the testing notes below.
+## Docked mode
 
-## Build and run
+Boosting only on input still gave me a small hitch at the start of each
+scroll while the GPU woke up. While in use kicks in when you move the
+pointer, so it's usually ready by the time you scroll. Always while docked
+just runs the whole time, which also covers typing and watching video.
 
-From the repository folder on a Mac:
+On my M5 Max, Always while docked + Gentle costs about **2% of total CPU**,
+roughly a third of one core. That's an easy trade for me when I'm at my desk.
+It won't fix buffering, low frame-rate video or every kind of stutter.
+
+## Original vs Metal 4 backend
+
+Quick runs of continuous Gentle on my Mac, done on development builds before
+1.0.0:
+
+| Backend  | CPU (one core) | Buffers/sec | GPU clock |
+| -------- | -------------- | ----------- | --------- |
+| Original | 45.5%          | 18,431      | 1620 MHz  |
+| Metal 4  | 32.1%          | 18,175      | 1620 MHz  |
+
+That's about 30% less CPU for the same amount of work. Both held 1620 MHz,
+so the win is lower overhead, not a faster GPU clock. Power readings bounced
+around too much to compare.
+
+## What you need
+
+- An Apple silicon Mac on macOS 26 or 27
+- Command Line Tools or Xcode
+- AC power, and an external display that's at least 5000 × 2000 pixels in
+  its current mode at 100 Hz or more (a Studio Display XDR reporting 0 Hz
+  counts too)
+
+## Build it
 
 ```bash
-chmod +x build.command
 ./build.command
 ```
 
-The script compiles an optimized native executable, creates the app bundle,
-ad-hoc signs it, and opens `build/M5ScrollBoost.app`. It preserves
-`-parse-as-library`, required by this Swift entry-point layout. To build
-without launching the GPU workload:
+That builds the app, ad-hoc signs it and opens `build/M5GPUBoost.app`. Add
+`--no-open` if you don't want it launched. Your previous build gets moved to
+`build/previous/`, not deleted.
+
+It lives in the menu bar. Add it to Login Items if you want it running at
+startup. It keeps its own settings, so don't run it at the same time as
+M5ScrollBoost.
+
+## Modes
+
+| Mode                | Boosts                                                                     |
+| ------------------- | -------------------------------------------------------------------------- |
+| Off                 | Never                                                                      |
+| On scroll           | While scrolling, for 0.9 seconds after                                     |
+| On activity         | Scrolling, dragging, clicks, gestures, app and Space switches; 0.9 seconds |
+| While in use        | On activity plus pointer movement; 2 seconds                               |
+| Always while docked | All the time while docked, awake and unlocked                              |
+| All-motion test     | All the time for 60 seconds, then back to On activity                      |
+
+New installs start on On activity. The input modes only boost when the
+pointer's on the qualifying display.
+
+| Strength | Workload                                       |
+| -------- | ---------------------------------------------- |
+| Gentle   | Four-byte buffer fill (Metal 4 when available) |
+| Balanced | Short sin/cos compute dispatch                 |
+
+Gentle is the one to start with.
+
+## Known issues
+
+- If Metal 4 fails while it's running, boosting stops until you hit **Check
+  Displays Again**. It only falls back to the original engine at startup.
+- There's no watchdog for a GPU lane that never finishes.
+- It is real GPU work, so quit it before gaming or benchmarking.
+
+## Tests
 
 ```bash
-./build.command --no-open
+./Tests/run-runtime-checks.command
 ```
 
-If the toolchain is missing, run `xcode-select --install`. If Xcode requires
-license acceptance, review and accept it in Xcode or with
-`sudo xcodebuild -license`. If Command Line Tools are installed alongside
-Xcode, you can select them for this build without changing your system-wide
-selection:
+Runs 67 checks against the real engines and controller, covering leases,
+restarts, fallback, mode timing, and sleep, wake, lock and unlock. They need
+a qualifying display connected, so CI only compiles them.
 
-```bash
-DEVELOPER_DIR=/Library/Developer/CommandLineTools ./build.command --no-open
-```
+My setup is an M5 Max MacBook Pro (18 CPU / 40 GPU cores, 64 GB) on macOS
+27.2.1, with a Dell U4025QW at 120 Hz scaled to 3840 × 1620. Lower scaled
+modes were already smooth. At 3840 × 1620 the difference was obvious.
 
-The app shows a bolt in the menu bar and has no Dock icon. You can copy the
-app to `/Applications` and optionally add it in System Settings → General →
-Login Items. It does not install itself or add a login item.
+## Scroll Replay
 
-Local builds are ad-hoc signed, not Developer ID signed or notarized.
-Redistributing that app does not provide the normal notarized macOS
-distribution experience. Source builds are the initial distribution method.
+[Scroll Replay](Tools/ScrollReplay/README.md) is Fred's companion app for
+repeatable Chrome scrolling. I haven't changed it.
 
-## Controls
+## Credit
 
-New installations default to **On scroll + Gentle**. Settings use stable
-identifiers, and recognized settings from older versions are migrated. A
-missing or unrecognized strength falls back to Gentle. A previously saved
-Continuous mode selection migrates to On scroll, and Strong migrates to
-Balanced. Existing Gentle and Balanced selections are preserved.
-
-| Mode | Behavior |
-| --- | --- |
-| Off | No GPU work is submitted. |
-| On scroll | Activates while scrolling with the pointer on a qualifying external display; stops 0.9 seconds after the last scroll event. |
-
-| Strength | Current workload per buffer |
-| --- | --- |
-| Gentle | Four-byte Metal blit fill. |
-| Balanced | 8,192 threads × 128 dependent sin/cos iterations. |
-
-Both strengths retain three queued command buffers with no deliberate
-sleep between submissions. Start with Gentle; try Balanced if scrolling
-does not improve. Balanced adds compute work and may compete with the
-foreground app.
-
-The filled bolt indicates the controller has requested boosting. The menu
-reports the average GPU execution time of completed batches, updated about
-every 750 ms. This value is not display frame time, GPU frequency, total
-utilization, or a power measurement.
-
-The app stops submitting GPU work when no qualifying external display is
-connected. Disconnecting the Studio Display XDR therefore stops the workload,
-unless another qualifying external display is connected. Other external 5K
-displays at 100 Hz or higher can also qualify. The menu-bar app remains open
-and monitors for display changes.
-
-The app pauses on battery, serious or critical thermal pressure, and display
-sleep. It uses a global scroll-wheel monitor; it does not modify or record
-scroll events. If On scroll does not trigger on your system, check the menu
-status and confirm the pointer is on a qualifying external display.
-
-## Limitations and testing
-
-This submits real GPU commands and can increase power use and heat, including
-with the small Gentle blit workload. Quit it before games, benchmarks, or
-sustained GPU rendering. It has no administrator helper, daemon, kernel
-extension, or permanent system modification. To uninstall, quit and delete
-the app; its mode and strength remain in the app's normal UserDefaults.
-
-Recorded testing of the Gentle blit workload used the following setup:
-
-- M5 Pro MacBook Pro, reported as 18 CPU cores / 40 GPU cores / 48 GB memory.
-  These are reported values, not a fresh hardware inventory or a general
-  compatibility claim.
-- Apple Studio Display XDR, 27-inch, 5120 × 2880, fixed 120 Hz, with an
-  Apple-supplied Thunderbolt cable.
-- macOS 26.6.2 and macOS 27.0.1; the app is currently running on 27.0.1.
-
-## Scroll Replay companion app
-
-[Scroll Replay](Tools/ScrollReplay/README.md) repeats native scroll input in
-Chrome for Off/On comparisons and video demonstrations. It has configurable
-speed, duration, direction, a countdown, and Escape cancellation. It builds
-separately and can also be used without M5ScrollBoost.
-
-## Project layout
-
-- `Sources/M5ScrollBoost.swift` — menu, display/power checks, and Metal engine.
-- `Info.plist` — menu-bar app metadata, deployment target, and version.
-- `Resources/` — app icon.
-- `build.command` — local build and ad-hoc signing.
-- `Tools/CADisplayLinkJitter.swift` — optional investigation utility; not part
-  of the app build or a measurement of actual presented frames.
-
-Raw traces, machine logs, local build products, and recoverable checkpoints
-are excluded from the public source repository.
+M5ScrollBoost is Frederic Bossy's work ([fwedbo](https://github.com/fwedbo)),
+MIT licensed; see [LICENSE](LICENSE). All my functional changes are in one
+commit on top of his, before the rename, so it's easy to diff against the
+original.
