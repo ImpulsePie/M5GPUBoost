@@ -277,7 +277,7 @@ private final class ReusableBlitEngine {
         }
     }
 
-    private let worker = DispatchQueue(label: "local.M5ScrollBoost.reusable", qos: .userInitiated)
+    private let worker = DispatchQueue(label: "io.github.impulsepie.M5GPUBoost.reusable", qos: .userInitiated)
     private let queue: MTL4CommandQueue
     private var lanes: [Lane] = []
     private var active = false
@@ -451,7 +451,7 @@ private final class LegacyMetalBoostEngine {
     private let pipeline: MTLComputePipelineState
     private let buffer: MTLBuffer
     private let worker = DispatchQueue(
-        label: "com.fredb.M5ScrollBoost.metal",
+        label: "io.github.impulsepie.M5GPUBoost.legacy",
         qos: .userInitiated
     )
 
@@ -650,7 +650,7 @@ private final class LegacyMetalBoostEngine {
 }
 
 final class BoostController: ObservableObject {
-    static let appVersion = "v1.5-local.1"
+    static let appVersion = "v1.0.0"
     @Published var mode: BoostMode {
         didSet {
             dockedTestWorkItem?.cancel()
@@ -1161,7 +1161,7 @@ final class BoostController: ObservableObject {
     private func diagnostic(_ message: String) {
         guard diagnosticsEnabled else { return }
         // Status only: no input contents, coordinates, window titles or files.
-        print("M5ScrollBoost: \(message)")
+        print("M5GPUBoost: \(message)")
         fflush(stdout)
     }
 
@@ -1210,7 +1210,7 @@ private struct BoostMenu: View {
     @ObservedObject var controller: BoostController
 
     var body: some View {
-        Text("M5 Scroll Boost \(BoostController.appVersion)").font(.caption).foregroundStyle(.secondary)
+        Text("M5GPUBoost \(BoostController.appVersion)").font(.caption).foregroundStyle(.secondary)
         Text(controller.displayText)
         Text(controller.statusText)
         if !controller.timingText.isEmpty {
@@ -1243,7 +1243,7 @@ private struct BoostMenu: View {
 
         Divider()
 
-        Button("Quit M5 Scroll Boost") {
+        Button("Quit M5GPUBoost") {
             controller.quit()
         }
         .keyboardShortcut("q")
@@ -1251,7 +1251,7 @@ private struct BoostMenu: View {
 }
 
 @main
-struct M5ScrollBoostApp: App {
+struct M5GPUBoostApp: App {
     @StateObject private var controller = BoostController()
 
     var body: some Scene {

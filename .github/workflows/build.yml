@@ -17,8 +17,8 @@ jobs:
         run: bash ./build.command --no-open
       - name: Verify app bundle
         run: |
-          plutil -lint build/M5ScrollBoost.app/Contents/Info.plist
-          codesign --verify --deep --strict build/M5ScrollBoost.app
+          plutil -lint build/M5GPUBoost.app/Contents/Info.plist
+          codesign --verify --deep --strict build/M5GPUBoost.app
       - name: Build Scroll Replay companion
         run: bash Tools/ScrollReplay/build.command --no-open
       - name: Verify Scroll Replay

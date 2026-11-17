@@ -4,20 +4,22 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>M5GPUBoost</string>
     <key>CFBundleExecutable</key>
-    <string>M5ScrollBoost</string>
+    <string>M5GPUBoost</string>
     <key>CFBundleIdentifier</key>
-    <string>com.fredb.M5ScrollBoost</string>
+    <string>io.github.impulsepie.M5GPUBoost</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleName</key>
-    <string>M5 Scroll Boost</string>
+    <string>M5GPUBoost</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>1.0.0</string>
     <key>CFBundleVersion</key>
     <string>100</string>
     <key>LSMinimumSystemVersion</key>
