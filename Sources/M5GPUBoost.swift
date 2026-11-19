@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import IOKit
 import IOKit.ps
 import Metal
 import SwiftUI
@@ -28,7 +29,6 @@ enum BoostMode: String, CaseIterable, Identifiable {
     case onInteraction = "on_interaction"
     case whileInUse = "while_in_use"
     case alwaysDocked = "always_docked"
-    case whileDocked = "while_docked"
 
     var id: String { rawValue }
 
@@ -39,13 +39,12 @@ enum BoostMode: String, CaseIterable, Identifiable {
         case .onInteraction: return "On activity"
         case .whileInUse: return "While in use (pointer movement too)"
         case .alwaysDocked: return "Always while docked (video too, highest cost)"
-        case .whileDocked: return "All-motion test (60 seconds)"
         }
     }
 
     func allows(_ activity: BoostActivity) -> Bool {
         switch self {
-        case .off, .whileDocked, .alwaysDocked: return false
+        case .off, .alwaysDocked: return false
         case .onScroll: return activity == .scroll
         case .onInteraction: return activity != .pointer
         case .whileInUse: return true
@@ -58,67 +57,86 @@ enum BoostMode: String, CaseIterable, Identifiable {
     var monitorsPointerMovement: Bool { self == .whileInUse }
 
     static func restored(from value: String?) -> BoostMode {
-        // A timed diagnostic must never become an always-on login setting.
-        if value == "while_docked" { return .onInteraction }
         if let value, let mode = Self(rawValue: value) { return mode }
-        if value == "Scroll & drag" { return .onInteraction }
-        // Retired modes, including Continuous, use activity-triggered work.
-        return allCases.first(where: { $0 != .whileDocked && $0.label == value }) ?? .onInteraction
+        // Retired modes (Continuous, the 60-second test) and older labels
+        // fall back to activity-triggered work, never to an always-on mode.
+        return allCases.first(where: { $0.label == value }) ?? .onInteraction
     }
 }
 
-enum BoostStrength: String, CaseIterable, Identifiable {
-    case gentle
-    case balanced
+/// The one workload both backends submit: a short compute dispatch.
+///
+/// The GPU reports two performance-state channels through IOReport, GPUPH and
+/// AFRSTATE. A four-byte fill (the old Gentle strength) holds the first at
+/// its top state but leaves the second cycling through every state. A
+/// dispatch of about 2,000 threads or more holds both. Fewer than three lanes,
+/// or any pause between submissions, lets the clock fall again.
+/// See docs/GPU-SCHEDULING.md for the measurements.
+private enum BoostWorkload {
+    static let threadCount = 4_096
+    static let iterations = 64
+    static let laneCount = 3
+    /// A lane normally completes in microseconds.
+    static let stallNanoseconds: UInt64 = 2_000_000_000
 
-    var id: String { rawValue }
+    static let shaderSource = """
+    #include <metal_stdlib>
+    using namespace metal;
 
-    var label: String {
-        switch self {
-        case .gentle: return "Gentle"
-        case .balanced: return "Balanced"
+    kernel void dvfsKeepAlive(
+        device float *values [[buffer(0)]],
+        uint id [[thread_position_in_grid]])
+    {
+        float value = values[id];
+
+        // A dependent recurrence prevents the compiler from removing the ALU
+        // work.
+        for (uint index = 0; index < \(iterations); ++index) {
+            value = sin(value) * cos(value) + 0.001f;
         }
+
+        values[id] = value;
+    }
+    """
+
+    static func makeBuffer(device: MTLDevice) -> MTLBuffer? {
+        guard let buffer = device.makeBuffer(
+            length: threadCount * MemoryLayout<Float>.stride, options: .storageModeShared) else { return nil }
+        let values = buffer.contents().bindMemory(to: Float.self, capacity: threadCount)
+        for index in 0..<threadCount { values[index] = Float(index + 1) * 0.0001 }
+        return buffer
+    }
+}
+
+/// What a backend's submission loop did since it was last asked.
+struct LoopSample {
+    let batchesPerSecond: Double
+    let gpuMicrosecondsPerBatch: Double
+}
+
+/// Counts completed batches on a backend's worker queue.
+private struct LoopCounter {
+    private var count = 0
+    private var gpuSeconds = 0.0
+    private var windowStart = DispatchTime.now().uptimeNanoseconds
+
+    mutating func reset() {
+        count = 0
+        gpuSeconds = 0
+        windowStart = DispatchTime.now().uptimeNanoseconds
     }
 
-    static func restored(from value: String?) -> BoostStrength {
-        if let value, let strength = Self(rawValue: value) { return strength }
-        switch value {
-        case "Gentle", "Gentle [blit 4B, 3-deep]": return .gentle
-        case "Balanced", "Balanced [sin/cos 4K, 3-deep]": return .balanced
-        case "strong", "Strong": return .balanced
-        default: return .gentle
-        }
+    mutating func add(gpuSeconds seconds: Double) {
+        count += 1
+        gpuSeconds += max(0, seconds)
     }
 
-    var threadCount: Int {
-        switch self {
-        case .gentle: return 4_096
-        case .balanced: return 8_192
-        }
-    }
-
-    var iterations: UInt32 {
-        switch self {
-        case .gentle: return 64
-        case .balanced: return 128
-        }
-    }
-
-    var queuedBufferCount: Int {
-        switch self {
-        case .gentle, .balanced: return 3
-        }
-    }
-
-    /// Gentle submits a four-byte blit; Balanced uses compute.
-    /// All profiles retain three queued buffers with no sleep between
-    /// submissions. Earlier compute-based Gentle measurements do not
-    /// validate this experimental blit profile.
-    var isBlit: Bool {
-        switch self {
-        case .gentle: return true
-        case .balanced: return false
-        }
+    mutating func take() -> LoopSample? {
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds &- windowStart) / 1_000_000_000
+        defer { reset() }
+        guard count > 0, elapsed >= 0.2 else { return nil }
+        return LoopSample(batchesPerSecond: Double(count) / elapsed,
+                          gpuMicrosecondsPerBatch: gpuSeconds / Double(count) * 1_000_000)
     }
 }
 
@@ -129,6 +147,8 @@ private struct DisplayInfo {
     let pixelWidth: Int
     let pixelHeight: Int
     let refreshRate: Double
+    /// The fastest the screen can refresh, from NSScreen. 0 when unknown.
+    var maximumFramesPerSecond = 0
 
     var isTarget: Bool {
         guard !isBuiltin else { return false }
@@ -138,13 +158,21 @@ private struct DisplayInfo {
         let isHighRefresh = refreshRate >= 100
         let isStudioDisplayXDR = name.localizedCaseInsensitiveContains("Studio Display XDR")
 
-        // Some adaptive modes report 0 Hz through CoreGraphics. Keep the exact
-        // Studio Display XDR name as a fallback, while requiring 5K dimensions.
-        return isFiveK && (isHighRefresh || (refreshRate == 0 && isStudioDisplayXDR))
+        // Some adaptive modes report 0 Hz through CoreGraphics. Then go by
+        // the screen's fastest refresh, or by the Studio Display XDR name.
+        let isAdaptiveHighRefresh = refreshRate == 0 && (maximumFramesPerSecond >= 100 || isStudioDisplayXDR)
+        return isFiveK && (isHighRefresh || isAdaptiveHighRefresh)
     }
 
     var summary: String {
-        let rate = refreshRate > 0 ? String(format: "%.0f Hz", refreshRate) : "adaptive rate"
+        let rate: String
+        if refreshRate > 0 {
+            rate = String(format: "%.0f Hz", refreshRate)
+        } else if maximumFramesPerSecond > 0 {
+            rate = "adaptive, up to \(maximumFramesPerSecond) Hz"
+        } else {
+            rate = "adaptive rate"
+        }
         return "\(name): \(pixelWidth)×\(pixelHeight), \(rate)"
     }
 }
@@ -205,88 +233,108 @@ private enum MetalBoostError: LocalizedError {
     }
 }
 
-/// Controller-facing routing stays on the main thread; each backend serializes
-/// its own GPU state. Keep the known-working backend for Balanced and fallback.
+/// Routes to the Metal 4 backend when the device supports it and to the
+/// original backend otherwise. If Metal 4 fails while running, the original
+/// backend takes over without the controller having to do anything.
+/// Used from the main thread; each backend serializes its own GPU state.
 private final class MetalBoostEngine {
-    private let legacy: LegacyMetalBoostEngine
-    private let reusable: ReusableBlitEngine?
+    private var metal4: Metal4BoostEngine?
+    private var original: OriginalBoostEngine?
     private var requestedActive = false
+    private var failureHandler: ((String) -> Void)?
+    private var noteHandler: ((String) -> Void)?
 
-    var backendDescription: String {
-        reusable == nil ? "original Metal" : "Metal 4 reusable Gentle; original Balanced"
+    var backendDescription: String { metal4 == nil ? "original Metal" : "Metal 4" }
+
+    init(useMetal4: Bool = true) throws {
+        metal4 = useMetal4 ? try? Metal4BoostEngine() : nil
+        if metal4 == nil {
+            original = try makeOriginal()
+        }
+        metal4?.setFailureHandler { [weak self] message in
+            DispatchQueue.main.async { self?.fallBack(reason: message) }
+        }
     }
 
-    init(useReusableBlits: Bool = true) throws {
-        legacy = try LegacyMetalBoostEngine()
-        reusable = useReusableBlits ? try? ReusableBlitEngine() : nil
-    }
+    /// Called once nothing else can take over.
+    func setFailureHandler(_ handler: @escaping (String) -> Void) { failureHandler = handler }
 
-    func setTelemetryHandler(_ handler: @escaping (Double) -> Void) {
-        legacy.setTelemetryHandler(handler)
-        reusable?.setTelemetryHandler(handler)
-    }
+    /// Called when the backend changes but boosting carries on.
+    func setNoteHandler(_ handler: @escaping (String) -> Void) { noteHandler = handler }
 
-    func setFailureHandler(_ handler: @escaping (String) -> Void) {
-        reusable?.setFailureHandler(handler)
-    }
-
-    func start(strength: BoostStrength) {
+    func start() {
         requestedActive = true
-        if strength.isBlit, let reusable {
-            legacy.stop()
-            reusable.start()
-        } else {
-            reusable?.stop()
-            legacy.start(strength: strength)
-        }
-    }
-
-    func updateStrength(_ strength: BoostStrength) {
-        if requestedActive {
-            start(strength: strength)
-        }
+        if let metal4 { metal4.start() } else { original?.start() }
     }
 
     func stop() {
         requestedActive = false
-        reusable?.stop()
-        legacy.stop()
+        metal4?.stop()
+        original?.stop()
+    }
+
+    func takeLoopSample() -> LoopSample? {
+        if let metal4 { return metal4.takeLoopSample() }
+        return original?.takeLoopSample()
+    }
+
+    private func makeOriginal() throws -> OriginalBoostEngine {
+        let engine = try OriginalBoostEngine()
+        engine.setFailureHandler { [weak self] message in
+            DispatchQueue.main.async { self?.failureHandler?(message) }
+        }
+        return engine
+    }
+
+    private func fallBack(reason: String) {
+        guard metal4 != nil else { return }
+        metal4 = nil
+        do {
+            let engine = try makeOriginal()
+            original = engine
+            if requestedActive { engine.start() }
+            noteHandler?("Metal 4 backend stopped (\(reason)); the original backend took over")
+        } catch {
+            failureHandler?("\(reason) \(error.localizedDescription)")
+        }
     }
 }
 
-/// Same four-byte fills and three continuously replenished lanes as Gentle,
-/// with command buffers and encoding memory reused after GPU completion.
-private final class ReusableBlitEngine {
-    private struct Resources {
-        let queue: MTL4CommandQueue
+/// Three lanes, each with its own command buffer, allocator, work buffer and
+/// argument table, reused after every GPU completion.
+private final class Metal4BoostEngine {
+    private final class Lane {
         let allocator: MTL4CommandAllocator
         let commandBuffer: MTL4CommandBuffer
         let buffer: MTLBuffer
         let residency: MTLResidencySet
-    }
-
-    private final class Lane {
-        let resources: Resources
+        let arguments: MTL4ArgumentTable
         let commands: [MTL4CommandBuffer]
         var busy = false
         var generation: UInt64 = 0
+        var submittedAt: UInt64 = 0
 
-        init(resources: Resources) {
-            self.resources = resources
-            commands = [resources.commandBuffer]
+        init(allocator: MTL4CommandAllocator, commandBuffer: MTL4CommandBuffer, buffer: MTLBuffer,
+             residency: MTLResidencySet, arguments: MTL4ArgumentTable) {
+            self.allocator = allocator
+            self.commandBuffer = commandBuffer
+            self.buffer = buffer
+            self.residency = residency
+            self.arguments = arguments
+            commands = [commandBuffer]
         }
     }
 
-    private let worker = DispatchQueue(label: "io.github.impulsepie.M5GPUBoost.reusable", qos: .userInitiated)
+    private let worker = DispatchQueue(label: "io.github.impulsepie.M5GPUBoost.metal4", qos: .userInitiated)
     private let queue: MTL4CommandQueue
+    private let pipeline: MTLComputePipelineState
+    private let grid = MTLSize(width: BoostWorkload.threadCount, height: 1, depth: 1)
+    private let group: MTLSize
     private var lanes: [Lane] = []
     private var active = false
     private var generation: UInt64 = 0
     private var lease = BoostLease()
-    private var sampleTotalMilliseconds = 0.0
-    private var sampleCount = 0
-    private var sampleWindowStart = DispatchTime.now().uptimeNanoseconds
-    private var telemetryHandler: ((Double) -> Void)?
+    private var counter = LoopCounter()
     private var failureHandler: ((String) -> Void)?
 
     init() throws {
@@ -296,97 +344,129 @@ private final class ReusableBlitEngine {
         // Leave feedback on Metal's default queue; serialize state on worker.
         // Feedback options are single-submission objects, not reusable lanes.
         queue = try device.makeMTL4CommandQueue(descriptor: MTL4CommandQueueDescriptor())
-        for _ in 0..<BoostStrength.gentle.queuedBufferCount {
+
+        let library: MTLLibrary
+        do {
+            library = try device.makeLibrary(source: BoostWorkload.shaderSource, options: nil)
+        } catch {
+            throw MetalBoostError.shaderCompilation(error.localizedDescription)
+        }
+        let function = MTL4LibraryFunctionDescriptor()
+        function.name = "dvfsKeepAlive"
+        function.library = library
+        let pipelineDescriptor = MTL4ComputePipelineDescriptor()
+        pipelineDescriptor.computeFunctionDescriptor = function
+        let compiler = try device.makeCompiler(descriptor: MTL4CompilerDescriptor())
+        pipeline = try compiler.makeComputePipelineState(descriptor: pipelineDescriptor, compilerTaskOptions: nil)
+        group = MTLSize(width: min(pipeline.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1)
+
+        let tableDescriptor = MTL4ArgumentTableDescriptor()
+        tableDescriptor.maxBufferBindCount = 1
+        for _ in 0..<BoostWorkload.laneCount {
             guard let allocator = device.makeCommandAllocator(),
                   let commandBuffer = device.makeCommandBuffer(),
-                  let buffer = device.makeBuffer(length: 4_096, options: .storageModeShared) else {
+                  let buffer = BoostWorkload.makeBuffer(device: device) else {
                 throw MetalBoostError.noBuffer
             }
-            // Independent buffers avoid overlapping writes between lanes in
-            // Metal 4, which doesn't provide automatic resource hazard tracking.
+            // Each lane writes its own buffer: Metal 4 doesn't track resource
+            // hazards, so lanes must not share one.
             let residency = try device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
             residency.addAllocation(buffer)
             residency.commit()
-            lanes.append(Lane(resources: Resources(queue: queue, allocator: allocator,
-                commandBuffer: commandBuffer, buffer: buffer, residency: residency)))
+            let arguments = try device.makeArgumentTable(descriptor: tableDescriptor)
+            arguments.setAddress(buffer.gpuAddress, index: 0)
+            lanes.append(Lane(allocator: allocator, commandBuffer: commandBuffer, buffer: buffer,
+                              residency: residency, arguments: arguments))
         }
-    }
-
-    func setTelemetryHandler(_ handler: @escaping (Double) -> Void) {
-        worker.async { [weak self] in self?.telemetryHandler = handler }
     }
 
     func setFailureHandler(_ handler: @escaping (String) -> Void) {
         worker.async { [weak self] in self?.failureHandler = handler }
     }
 
+    /// Starts the loop or, if it is already running, renews its lease. Also
+    /// the watchdog: a lane whose feedback never arrived is reported here.
     func start() {
         worker.async { [weak self] in
             guard let self else { return }
-            self.lease.renew(at: DispatchTime.now().uptimeNanoseconds)
+            let now = DispatchTime.now().uptimeNanoseconds
+            if self.lanes.contains(where: { $0.busy && now &- $0.submittedAt > BoostWorkload.stallNanoseconds }) {
+                self.fail("A Metal 4 lane stopped responding.")
+                return
+            }
+            self.lease.renew(at: now)
             guard !self.active else { return }
             self.active = true
             self.generation &+= 1
-            self.resetTelemetryWindow()
-            for index in self.lanes.indices { self.submit(index: index) }
+            self.counter.reset()
+            for lane in self.lanes { self.submit(lane) }
         }
     }
 
     func stop() {
         worker.async { [weak self] in
             guard let self, self.active else { return }
-            self.active = false
-            self.generation &+= 1
-            self.resetTelemetryWindow()
+            self.deactivate()
         }
     }
 
-    private func resetTelemetryWindow() {
-        sampleTotalMilliseconds = 0
-        sampleCount = 0
-        sampleWindowStart = DispatchTime.now().uptimeNanoseconds
+    func takeLoopSample() -> LoopSample? {
+        worker.sync { active ? counter.take() : nil }
+    }
+
+    private func deactivate() {
+        active = false
+        generation &+= 1
+        counter.reset()
     }
 
     private func fail(_ message: String) {
-        active = false
-        generation &+= 1
-        resetTelemetryWindow()
-        failureHandler?(message)
+        deactivate()
+        let handler = failureHandler
+        // One report only: after this the router replaces the backend.
+        failureHandler = nil
+        handler?(message)
     }
 
-    private func submit(index: Int) {
+    private func submit(_ lane: Lane) {
         guard active else { return }
-        guard lease.isValid(at: DispatchTime.now().uptimeNanoseconds) else {
-            active = false
-            generation &+= 1
-            resetTelemetryWindow()
+        let now = DispatchTime.now().uptimeNanoseconds
+        // A stalled controller cannot leave the GPU submission loop running.
+        guard lease.isValid(at: now) else {
+            deactivate()
             return
         }
-        let lane = lanes[index]
         // A rapid stop/restart may still have old GPU work outstanding. Only
         // its completion can clear busy and make this allocator safe to reset.
         guard !lane.busy else { return }
         autoreleasepool {
-            let resources = lane.resources
-            resources.allocator.reset()
-            resources.commandBuffer.beginCommandBuffer(allocator: resources.allocator)
-            resources.commandBuffer.useResidencySet(resources.residency)
-            guard let encoder = resources.commandBuffer.makeComputeCommandEncoder() else {
-                fail("The Metal 4 blit encoder could not be created.")
+            lane.allocator.reset()
+            lane.commandBuffer.beginCommandBuffer(allocator: lane.allocator)
+            lane.commandBuffer.useResidencySet(lane.residency)
+            guard let encoder = lane.commandBuffer.makeComputeCommandEncoder() else {
+                fail("The Metal 4 compute encoder could not be created.")
                 return
             }
-            encoder.fill(buffer: resources.buffer, range: 0..<4, value: 0)
+            encoder.setComputePipelineState(pipeline)
+            encoder.setArgumentTable(lane.arguments)
+            encoder.dispatchThreads(threadsPerGrid: grid, threadsPerThreadgroup: group)
             encoder.endEncoding()
-            resources.commandBuffer.endCommandBuffer()
+            lane.commandBuffer.endCommandBuffer()
             lane.busy = true
             lane.generation = generation
+            lane.submittedAt = now
             let options = MTL4CommitOptions()
-            options.addFeedbackHandler { [weak self, resources] feedback in
-                // Metal 4 doesn't retain resource references. Keep command
-                // memory, buffers, residency and queue alive through completion.
-                self?.worker.async { [weak self, resources] in
-                    withExtendedLifetime(resources) {
-                        self?.completed(index: index, feedback: feedback)
+            options.addFeedbackHandler { [weak self, lane, queue, pipeline] feedback in
+                // Metal 4 doesn't retain resource references. Keep the lane,
+                // queue and pipeline alive through completion.
+                let start = feedback.gpuStartTime, end = feedback.gpuEndTime, error = feedback.error
+                guard let self else {
+                    withExtendedLifetime((lane, queue, pipeline)) {}
+                    return
+                }
+                self.worker.async { [weak self] in
+                    withExtendedLifetime((lane, queue, pipeline)) {
+                        self?.completed(lane, gpuSeconds: end - start, error: error)
                     }
                 }
             }
@@ -394,76 +474,48 @@ private final class ReusableBlitEngine {
         }
     }
 
-    private func completed(index: Int, feedback: MTL4CommitFeedback) {
-        let lane = lanes[index]
+    private func completed(_ lane: Lane, gpuSeconds: Double, error: Error?) {
         lane.busy = false
         guard active else { return }
-        if let error = feedback.error {
+        if let error {
             fail("Metal 4 submission failed: \(error.localizedDescription)")
             return
         }
         if lane.generation == generation {
-            let milliseconds = max(0, (feedback.gpuEndTime - feedback.gpuStartTime) * 1_000)
-            if milliseconds > 0 {
-                sampleTotalMilliseconds += milliseconds
-                sampleCount += 1
-                let now = DispatchTime.now().uptimeNanoseconds
-                if now &- sampleWindowStart >= 750_000_000 {
-                    let average = sampleTotalMilliseconds / Double(sampleCount)
-                    resetTelemetryWindow()
-                    telemetryHandler?(average)
-                }
-            }
+            counter.add(gpuSeconds: gpuSeconds)
         }
         // A completion from an earlier burst may now refill its lane for the
         // current generation; it must never renew the controller's lease.
-        submit(index: index)
+        submit(lane)
     }
 }
 
+/// Fred's engine: a new command buffer for every submission, from a queue
+/// limited to eight. Used where Metal 4 is unavailable or has failed.
+///
 /// Keeps a few short command buffers queued instead of submitting one long
 /// dispatch. The GPU can yield at command-buffer boundaries frequently, which
 /// reduces the chance of blocking WindowServer for an entire 8.33 ms frame.
-private final class LegacyMetalBoostEngine {
-    private static let shaderSource = """
-    #include <metal_stdlib>
-    using namespace metal;
-
-    kernel void dvfsKeepAlive(
-        device float *values [[buffer(0)]],
-        constant uint &iterations [[buffer(1)]],
-        uint id [[thread_position_in_grid]])
-    {
-        float value = values[id];
-
-        // A dependent recurrence prevents the compiler from removing the ALU
-        // work. It intentionally mirrors the workload that improved the trace,
-        // but each dispatch is much shorter.
-        for (uint index = 0; index < iterations; ++index) {
-            value = sin(value) * cos(value) + 0.001f;
-        }
-
-        values[id] = value;
-    }
-    """
-
+private final class OriginalBoostEngine {
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState
     private let buffer: MTLBuffer
+    private let grid = MTLSize(width: BoostWorkload.threadCount, height: 1, depth: 1)
+    private let group: MTLSize
     private let worker = DispatchQueue(
-        label: "io.github.impulsepie.M5GPUBoost.legacy",
+        label: "io.github.impulsepie.M5GPUBoost.original",
         qos: .userInitiated
     )
 
     private var active = false
     private var lease = BoostLease()
     private var generation: UInt64 = 0
-    private var strength: BoostStrength = .balanced
-    private var sampleTotalMilliseconds = 0.0
-    private var sampleCount = 0
-    private var sampleWindowStart = DispatchTime.now().uptimeNanoseconds
-    private let telemetryIntervalNanoseconds: UInt64 = 750_000_000
-    private var telemetryHandler: ((Double) -> Void)?
+    /// Submissions of the current generation that haven't completed yet.
+    private var inFlight = 0
+    private var lastProgress: UInt64 = 0
+    private var restartedAfterStall = false
+    private var counter = LoopCounter()
+    private var failureHandler: ((String) -> Void)?
 
     init() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -475,7 +527,7 @@ private final class LegacyMetalBoostEngine {
 
         let library: MTLLibrary
         do {
-            library = try device.makeLibrary(source: Self.shaderSource, options: nil)
+            library = try device.makeLibrary(source: BoostWorkload.shaderSource, options: nil)
         } catch {
             throw MetalBoostError.shaderCompilation(error.localizedDescription)
         }
@@ -486,196 +538,282 @@ private final class LegacyMetalBoostEngine {
 
         self.commandQueue = queue
         self.pipeline = try device.makeComputePipelineState(function: function)
+        self.group = MTLSize(width: min(pipeline.maxTotalThreadsPerThreadgroup, 256), height: 1, depth: 1)
 
-        let elementCount = 16_384
-        let byteCount = elementCount * MemoryLayout<Float>.stride
-        guard let workBuffer = device.makeBuffer(length: byteCount, options: .storageModeShared) else {
+        guard let workBuffer = BoostWorkload.makeBuffer(device: device) else {
             throw MetalBoostError.noBuffer
         }
         self.buffer = workBuffer
-
-        let values = workBuffer.contents().bindMemory(to: Float.self, capacity: elementCount)
-        for index in 0..<elementCount {
-            values[index] = Float(index + 1) * 0.0001
-        }
     }
 
-    func setTelemetryHandler(_ handler: @escaping (Double) -> Void) {
-        worker.async { [weak self] in
-            self?.telemetryHandler = handler
-        }
+    func setFailureHandler(_ handler: @escaping (String) -> Void) {
+        worker.async { [weak self] in self?.failureHandler = handler }
     }
 
-    func start(strength requestedStrength: BoostStrength) {
+    /// Starts the loop or, if it is already running, renews its lease, refills
+    /// any lane that failed to submit and restarts lanes that have stalled.
+    func start() {
         worker.async { [weak self] in
             guard let self else { return }
-            let laneCountChanged = self.strength.queuedBufferCount != requestedStrength.queuedBufferCount
-            self.strength = requestedStrength
-            self.lease.renew(at: DispatchTime.now().uptimeNanoseconds)
+            let now = DispatchTime.now().uptimeNanoseconds
+            self.lease.renew(at: now)
 
             if self.active {
-                if laneCountChanged {
-                    self.restartSubmissionLanes()
+                if now &- self.lastProgress > BoostWorkload.stallNanoseconds {
+                    guard !self.restartedAfterStall else {
+                        self.fail("The GPU stopped completing work.")
+                        return
+                    }
+                    self.restartedAfterStall = true
+                    self.beginGeneration(at: now)
                 }
-                return
+            } else {
+                self.active = true
+                self.restartedAfterStall = false
+                self.counter.reset()
+                self.beginGeneration(at: now)
             }
-
-            self.active = true
-            self.resetTelemetryWindow()
-            self.generation &+= 1
-            let token = self.generation
-
-            for _ in 0..<requestedStrength.queuedBufferCount {
-                self.submit(token: token)
-            }
-        }
-    }
-
-    func updateStrength(_ requestedStrength: BoostStrength) {
-        worker.async { [weak self] in
-            guard let self else { return }
-            let laneCountChanged = self.strength.queuedBufferCount != requestedStrength.queuedBufferCount
-            self.strength = requestedStrength
-            self.resetTelemetryWindow()
-
-            if self.active && laneCountChanged {
-                self.restartSubmissionLanes()
-            }
+            self.fillLanes()
         }
     }
 
     func stop() {
         worker.async { [weak self] in
             guard let self, self.active else { return }
-            self.active = false
-            self.generation &+= 1
-            self.resetTelemetryWindow()
+            self.deactivate()
         }
     }
 
-    private func restartSubmissionLanes() {
+    func takeLoopSample() -> LoopSample? {
+        worker.sync { active ? counter.take() : nil }
+    }
+
+    private func beginGeneration(at now: UInt64) {
         generation &+= 1
-        let token = generation
-
-        for _ in 0..<strength.queuedBufferCount {
-            submit(token: token)
-        }
+        inFlight = 0
+        lastProgress = now
     }
 
-    private func resetTelemetryWindow() {
-        sampleTotalMilliseconds = 0
-        sampleCount = 0
-        sampleWindowStart = DispatchTime.now().uptimeNanoseconds
+    private func deactivate() {
+        active = false
+        generation &+= 1
+        inFlight = 0
+        counter.reset()
     }
 
-    private func submit(token: UInt64) {
-        guard active, token == generation else { return }
-        // A stalled controller cannot leave the GPU submission loop running.
-        guard lease.isValid(at: DispatchTime.now().uptimeNanoseconds) else {
-            active = false
-            generation &+= 1
-            resetTelemetryWindow()
-            return
-        }
+    private func fail(_ message: String) {
+        deactivate()
+        failureHandler?(message)
+    }
 
-        autoreleasepool {
-            guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+    private func fillLanes() {
+        while active, inFlight < BoostWorkload.laneCount {
+            // A stalled controller cannot leave the GPU submission loop running.
+            guard lease.isValid(at: DispatchTime.now().uptimeNanoseconds) else {
+                deactivate()
                 return
             }
-            let currentStrength = strength
-
-            if currentStrength.isBlit {
-                guard let encoder = commandBuffer.makeBlitCommandEncoder() else {
-                    return
-                }
-                encoder.fill(buffer: buffer, range: 0..<4, value: 0)
-                encoder.endEncoding()
-            } else {
-                guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
-                    return
-                }
-
-                var iterations = currentStrength.iterations
-
-                encoder.setComputePipelineState(pipeline)
-                encoder.setBuffer(buffer, offset: 0, index: 0)
-                encoder.setBytes(
-                    &iterations,
-                    length: MemoryLayout<UInt32>.stride,
-                    index: 1
-                )
-
-                let grid = MTLSize(width: currentStrength.threadCount, height: 1, depth: 1)
-                let groupWidth = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
-                let group = MTLSize(width: groupWidth, height: 1, depth: 1)
-                encoder.dispatchThreads(grid, threadsPerThreadgroup: group)
-                encoder.endEncoding()
-            }
-
-            commandBuffer.addCompletedHandler { [weak self] completedBuffer in
-                guard let self else { return }
-                let milliseconds = max(
-                    0,
-                    (completedBuffer.gpuEndTime - completedBuffer.gpuStartTime) * 1_000
-                )
-
-                self.worker.async { [weak self] in
-                    self?.completed(token: token, milliseconds: milliseconds)
-                }
-            }
-
-            commandBuffer.commit()
+            // A submission that can't be made is retried on the next start.
+            guard submit() else { return }
         }
     }
 
-    private func completed(token: UInt64, milliseconds: Double) {
-        guard active, token == generation else { return }
-
-        if milliseconds > 0 {
-            sampleTotalMilliseconds += milliseconds
-            sampleCount += 1
-
-            let now = DispatchTime.now().uptimeNanoseconds
-            if now &- sampleWindowStart >= telemetryIntervalNanoseconds {
-                let average = sampleTotalMilliseconds / Double(sampleCount)
-                sampleTotalMilliseconds = 0
-                sampleCount = 0
-                sampleWindowStart = now
-                telemetryHandler?(average)
+    private func submit() -> Bool {
+        autoreleasepool {
+            guard let commandBuffer = commandQueue.makeCommandBuffer(),
+                  let encoder = commandBuffer.makeComputeCommandEncoder() else {
+                return false
             }
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(buffer, offset: 0, index: 0)
+            encoder.dispatchThreads(grid, threadsPerThreadgroup: group)
+            encoder.endEncoding()
+
+            let token = generation
+            commandBuffer.addCompletedHandler { [weak self] completedBuffer in
+                guard let self else { return }
+                let seconds = completedBuffer.gpuEndTime - completedBuffer.gpuStartTime
+                let error = completedBuffer.error
+
+                self.worker.async { [weak self] in
+                    self?.completed(token: token, gpuSeconds: seconds, error: error)
+                }
+            }
+
+            inFlight += 1
+            commandBuffer.commit()
+            return true
+        }
+    }
+
+    private func completed(token: UInt64, gpuSeconds: Double, error: Error?) {
+        guard active, token == generation else { return }
+        inFlight -= 1
+        if let error {
+            fail("Metal submission failed: \(error.localizedDescription)")
+            return
+        }
+        lastProgress = DispatchTime.now().uptimeNanoseconds
+        restartedAfterStall = false
+        counter.add(gpuSeconds: gpuSeconds)
+        fillLanes()
+    }
+}
+
+/// Reads how long the GPU spent in each performance state, so the menu can
+/// say whether the boost is actually holding the clock.
+///
+/// The figures come from IOReport, which is a private library. Every symbol
+/// is looked up at run time and the monitor is simply absent if any part is
+/// missing; the app then shows the submission rate instead.
+/// Used from the main thread.
+private final class GPUClockMonitor {
+    struct Reading {
+        /// Share of the window spent in the top state, 0...1, per channel.
+        let mainShare: Double
+        let secondShare: Double?
+        let megahertz: Int?
+
+        var heldShare: Double { min(mainShare, secondShare ?? 1) }
+    }
+
+    /// One subscription for the life of the process.
+    static let shared = GPUClockMonitor()
+
+    private typealias CopyChannelsFn = @convention(c) (CFString?, CFString?, UInt64, UInt64, UInt64) -> Unmanaged<CFDictionary>?
+    private typealias MergeChannelsFn = @convention(c) (CFMutableDictionary, CFDictionary, CFTypeRef?) -> Void
+    private typealias SubscribeFn = @convention(c) (UnsafeRawPointer?, CFMutableDictionary, UnsafeMutablePointer<Unmanaged<CFMutableDictionary>?>, UInt64, CFTypeRef?) -> OpaquePointer?
+    private typealias SamplesFn = @convention(c) (OpaquePointer, CFMutableDictionary?, CFTypeRef?) -> Unmanaged<CFDictionary>?
+    private typealias DeltaFn = @convention(c) (CFDictionary, CFDictionary, CFTypeRef?) -> Unmanaged<CFDictionary>?
+    private typealias ChannelNameFn = @convention(c) (CFDictionary) -> Unmanaged<CFString>?
+    private typealias StateCountFn = @convention(c) (CFDictionary) -> Int32
+    private typealias StateNameFn = @convention(c) (CFDictionary, Int32) -> Unmanaged<CFString>?
+    private typealias StateResidencyFn = @convention(c) (CFDictionary, Int32) -> Int64
+
+    private let createSamples: SamplesFn
+    private let createDelta: DeltaFn
+    private let channelName: ChannelNameFn
+    private let stateCount: StateCountFn
+    private let stateName: StateNameFn
+    private let stateResidency: StateResidencyFn
+    private let subscription: OpaquePointer
+    private let channels: CFMutableDictionary
+    private let topStateName: String
+    private let megahertz: Int?
+    private var previous: CFDictionary?
+
+    private init?() {
+        guard let library = dlopen("/usr/lib/libIOReport.dylib", RTLD_LAZY) else { return nil }
+        func symbol<T>(_ name: String, as type: T.Type) -> T? {
+            dlsym(library, name).map { unsafeBitCast($0, to: type) }
+        }
+        guard let copyChannels = symbol("IOReportCopyChannelsInGroup", as: CopyChannelsFn.self),
+              let mergeChannels = symbol("IOReportMergeChannels", as: MergeChannelsFn.self),
+              let subscribe = symbol("IOReportCreateSubscription", as: SubscribeFn.self),
+              let createSamples = symbol("IOReportCreateSamples", as: SamplesFn.self),
+              let createDelta = symbol("IOReportCreateSamplesDelta", as: DeltaFn.self),
+              let channelName = symbol("IOReportChannelGetChannelName", as: ChannelNameFn.self),
+              let stateCount = symbol("IOReportStateGetCount", as: StateCountFn.self),
+              let stateName = symbol("IOReportStateGetNameForIndex", as: StateNameFn.self),
+              let stateResidency = symbol("IOReportStateGetResidency", as: StateResidencyFn.self),
+              let top = Self.topState() else {
+            return nil
         }
 
-        submit(token: token)
+        guard let main = copyChannels("GPU Stats" as CFString, "GPU Performance States" as CFString, 0, 0, 0)?
+                .takeRetainedValue(),
+              let desired = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, main) else {
+            return nil
+        }
+        // Not every GPU reports the second channel; one is enough.
+        if let second = copyChannels("GPU Stats" as CFString, "AFR Performance States" as CFString, 0, 0, 0)?
+            .takeRetainedValue() {
+            mergeChannels(desired, second, nil)
+        }
+        var subscribed: Unmanaged<CFMutableDictionary>?
+        guard let subscription = subscribe(nil, desired, &subscribed, 0, nil),
+              let channels = subscribed?.takeRetainedValue() else {
+            return nil
+        }
+
+        self.createSamples = createSamples
+        self.createDelta = createDelta
+        self.channelName = channelName
+        self.stateCount = stateCount
+        self.stateName = stateName
+        self.stateResidency = stateResidency
+        self.subscription = subscription
+        self.channels = channels
+        topStateName = "P\(top.index)"
+        megahertz = top.megahertz
+    }
+
+    /// The GPU's highest performance state and its frequency, from the
+    /// device tree: `perf-states` holds a frequency and a voltage per state,
+    /// starting with the powered-off entry.
+    private static func topState() -> (index: Int, megahertz: Int?)? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceNameMatching("sgx"))
+        guard service != 0 else { return nil }
+        defer { IOObjectRelease(service) }
+        func property(_ key: String) -> Data? {
+            IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? Data
+        }
+        func word(_ data: Data, at offset: Int) -> UInt32? {
+            guard offset >= 0, data.count >= offset + 4 else { return nil }
+            return data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: UInt32.self) }
+        }
+        guard let countData = property("perf-state-count"), let count = word(countData, at: 0), count >= 2 else {
+            return nil
+        }
+        let index = Int(count) - 1
+        let hertz = property("perf-states").flatMap { word($0, at: index * 8) }
+        return (index, hertz.flatMap { $0 > 0 ? Int(($0 + 500_000) / 1_000_000) : nil })
+    }
+
+    /// Starts a new measuring window without reporting the old one.
+    func mark() {
+        previous = createSamples(subscription, channels, nil)?.takeRetainedValue()
+    }
+
+    /// The share of time in the top state since the last `mark` or `read`.
+    func read() -> Reading? {
+        guard let current = createSamples(subscription, channels, nil)?.takeRetainedValue() else { return nil }
+        defer { previous = current }
+        guard let previous,
+              let delta = createDelta(previous, current, nil)?.takeRetainedValue() as NSDictionary?,
+              let entries = delta["IOReportChannels"] as? [NSDictionary] else {
+            return nil
+        }
+        var shares: [String: Double] = [:]
+        for entry in entries {
+            let channel = entry as CFDictionary
+            guard let name = channelName(channel)?.takeUnretainedValue() as String? else { continue }
+            var total: Int64 = 0, top: Int64 = 0
+            for index in 0..<max(0, stateCount(channel)) {
+                let residency = stateResidency(channel, index)
+                total += residency
+                if (stateName(channel, index)?.takeUnretainedValue() as String?) == topStateName {
+                    top = residency
+                }
+            }
+            if total > 0 { shares[name] = Double(top) / Double(total) }
+        }
+        guard let main = shares["GPUPH"] else { return nil }
+        return Reading(mainShare: main, secondShare: shares["AFRSTATE"], megahertz: megahertz)
     }
 }
 
 final class BoostController: ObservableObject {
-    static let appVersion = "v1.0.0"
+    static let appVersion = "v1.1.0"
     @Published var mode: BoostMode {
         didSet {
-            dockedTestWorkItem?.cancel()
-            dockedTestDeadline = nil
-            if mode == .whileDocked {
-                dockedTestDeadline = ProcessInfo.processInfo.systemUptime + 60
-                let item = DispatchWorkItem { [weak self] in
-                    guard let self, self.mode == .whileDocked else { return }
-                    self.mode = .onInteraction
-                }
-                dockedTestWorkItem = item
-                DispatchQueue.main.asyncAfter(deadline: .now() + 60, execute: item)
-            }
-            let savedMode = mode == .whileDocked ? BoostMode.onInteraction : mode
-            UserDefaults.standard.set(savedMode.rawValue, forKey: "boostMode")
+            UserDefaults.standard.set(mode.rawValue, forKey: "boostMode")
+            sessionSeconds = 0
+            sessionHeldSeconds = 0
             // The event mask depends on the mode; reevaluate reinstalls it.
             removeEventMonitor()
             reevaluate()
-        }
-    }
-
-    @Published var strength: BoostStrength {
-        didSet {
-            UserDefaults.standard.set(strength.rawValue, forKey: "boostStrength")
-            engine?.updateStrength(strength)
         }
     }
 
@@ -690,23 +828,33 @@ final class BoostController: ObservableObject {
     @Published private(set) var showsBoosting = false
     @Published private(set) var statusText = "Starting…"
     @Published private(set) var displayText = "Checking displays…"
-    @Published private(set) var timingText = ""
+    /// Whether the boost is holding the GPU clock, or the submission rate
+    /// where the clock can't be read. Empty while idle.
+    @Published private(set) var readoutText = ""
     @Published private(set) var hasTargetDisplay = false
 
     private var engine: MetalBoostEngine?
     private var engineError: String?
+    private let clockMonitor = GPUClockMonitor.shared
+    private var readoutWindowStart = 0.0
+    /// Boosted time since launch or the last mode change, and how much of it
+    /// was spent at the top clock state.
+    private var sessionSeconds = 0.0
+    private var sessionHeldSeconds = 0.0
     private var interactionMonitor: Any?
     private var stopBurstWorkItem: DispatchWorkItem?
     private var refreshTimer: Timer?
     private var notificationTokens: [NSObjectProtocol] = []
     private var powerSource: CFRunLoopSource?
     private var displayRefreshWorkItem: DispatchWorkItem?
-    private var dockedTestWorkItem: DispatchWorkItem?
-    private var dockedTestDeadline: Double?
     private var screensAreAwake = true
     private var indicatorSettleWorkItem: DispatchWorkItem?
     private var continuousActivity: NSObjectProtocol?
-    /// Refreshed in reevaluate, never on the per-event path.
+    /// Refreshed in reevaluate, never on the per-event path. Display, power
+    /// and lock changes all arrive as notifications that call reevaluate,
+    /// and the 2-second timer covers any that are missed.
+    private var displays: [DisplayInfo] = []
+    private var usingACPower = false
     private var screenIsLocked = false
     private var lockPollTimer: Timer?
     private var lockStateProvider: () -> Bool = BoostController.sessionIsLocked
@@ -726,17 +874,15 @@ final class BoostController: ObservableObject {
     init() {
         let defaults = UserDefaults.standard
         self.mode = BoostMode.restored(from: defaults.string(forKey: "boostMode"))
-        self.strength = BoostStrength.restored(from: defaults.string(forKey: "boostStrength"))
         defaults.set(mode.rawValue, forKey: "boostMode")
-        defaults.set(strength.rawValue, forKey: "boostStrength")
+        // 1.0 had Gentle and Balanced strengths; there is one workload now.
+        defaults.removeObject(forKey: "boostStrength")
 
         installNotifications()
         installPowerNotifications()
         reevaluate()
         diagnostic("Ready: \(mode.label); \(displayText); \(statusText)")
-        if CommandLine.arguments.contains("--test-docked") {
-            DispatchQueue.main.async { [weak self] in self?.mode = .whileDocked }
-        }
+        if clockMonitor == nil { diagnostic("GPU clock states can't be read here; showing the submission rate") }
     }
 
     deinit {
@@ -746,10 +892,9 @@ final class BoostController: ObservableObject {
         refreshTimer?.invalidate()
         stopBurstWorkItem?.cancel()
         displayRefreshWorkItem?.cancel()
-        dockedTestWorkItem?.cancel()
         indicatorSettleWorkItem?.cancel()
         lockPollTimer?.invalidate()
-        setContinuousActivity(false)
+        setBoostActivity(false)
         if let powerSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), powerSource, .commonModes)
         }
@@ -903,19 +1048,11 @@ final class BoostController: ObservableObject {
             let createdEngine = try MetalBoostEngine()
             engine = createdEngine
             createdEngine.setFailureHandler { [weak self, weak createdEngine] message in
-                DispatchQueue.main.async { [weak self, weak createdEngine] in
-                    guard let self, let createdEngine, self.engine === createdEngine else { return }
-                    self.engineError = message
-                    self.suspend(status: message)
-                }
+                guard let self, let createdEngine, self.engine === createdEngine else { return }
+                self.engineError = message
+                self.suspend(status: message)
             }
-            createdEngine.setTelemetryHandler { [weak self] milliseconds in
-                DispatchQueue.main.async { [weak self] in
-                    guard let self, self.isBoosting else { return }
-                    let text = String(format: "Metal batch: %.2f ms average", milliseconds)
-                    if self.timingText != text { self.timingText = text }
-                }
-            }
+            createdEngine.setNoteHandler { [weak self] message in self?.diagnostic(message) }
             diagnostic("Metal engine ready (\(createdEngine.backendDescription))")
             return true
         } catch {
@@ -941,7 +1078,6 @@ final class BoostController: ObservableObject {
         stopBoost(status: status)
         if engine != nil { diagnostic("Standby: Metal engine released; input monitoring off") }
         engine = nil
-        setContinuousActivity(false)
     }
 
     /// The session dictionary is absent or lacks the key when unlocked; any
@@ -967,14 +1103,16 @@ final class BoostController: ObservableObject {
         }
     }
 
-    /// "Always while docked" depends on the 2-second timer renewing the
-    /// engine's 3-second lease. Without this, App Nap may delay that timer in
-    /// a windowless app and open gaps in the boost. System sleep stays allowed.
-    private func setContinuousActivity(_ on: Bool) {
+    /// Held for as long as a boost is running, in every mode. App Nap would
+    /// otherwise be free to slow a windowless app: "Always while docked"
+    /// depends on the 2-second timer renewing the engine's 3-second lease,
+    /// and any delay to the submission threads lets the GPU clock fall.
+    /// System sleep stays allowed.
+    private func setBoostActivity(_ on: Bool) {
         if on, continuousActivity == nil {
             continuousActivity = ProcessInfo.processInfo.beginActivity(
                 options: .userInitiatedAllowingIdleSystemSleep,
-                reason: "Continuous GPU boost while docked")
+                reason: "Holding the GPU clock for a high-refresh display")
         } else if !on, let token = continuousActivity {
             ProcessInfo.processInfo.endActivity(token)
             continuousActivity = nil
@@ -987,18 +1125,16 @@ final class BoostController: ObservableObject {
         guard mode.allows(activity) else { return }
 
         // High-polling mice can deliver hundreds of drag events per second.
-        // Check power/display state at most 12.5 times/sec during a burst;
-        // this does not throttle, consume or modify the input events.
+        // Act on at most 12.5 of them a second during a burst; this does not
+        // throttle, consume or modify the input events. Display, power and
+        // lock state come from the last reevaluate, not from new queries.
         let now = ProcessInfo.processInfo.systemUptime
         guard now - lastInteractionCheck >= interactionCheckInterval else { return }
         lastInteractionCheck = now
         let point = point ?? NSEvent.mouseLocation
 
-        let displays = displayInfos()
-        updateDisplayText(from: displays)
-
-        guard canBoost(displays: displays) else { return }
-        guard let pointerDisplay = display(at: point, from: displays), pointerDisplay.isTarget else {
+        guard canBoost() else { return }
+        guard let pointerDisplay = display(at: point), pointerDisplay.isTarget else {
             stopBurstWorkItem?.cancel()
             stopBoost(status: "Ready — use the external high-refresh display")
             return
@@ -1018,19 +1154,15 @@ final class BoostController: ObservableObject {
     }
 
     private func reevaluate(periodic: Bool = false) {
-        if mode == .whileDocked, let deadline = dockedTestDeadline,
-           ProcessInfo.processInfo.systemUptime >= deadline {
-            mode = .onInteraction
-            return
-        }
         screenIsLocked = lockStateProvider()
         setLockPolling(screenIsLocked && mode != .off)
-        let displays = displayInfos()
+        displays = displayInfos()
+        usingACPower = Self.isUsingACPower()
         let targetPresent = displays.contains(where: \.isTarget)
         if hasTargetDisplay != targetPresent { hasTargetDisplay = targetPresent }
-        updateDisplayText(from: displays)
+        updateDisplayText()
 
-        if let reason = environment(displays: displays).pauseReason {
+        if let reason = environment.pauseReason {
             suspend(status: reason)
             return
         }
@@ -1043,7 +1175,6 @@ final class BoostController: ObservableObject {
             return
         }
         startRefreshTimer()
-        setContinuousActivity(mode == .alwaysDocked)
 
         switch mode {
         case .off:
@@ -1051,11 +1182,9 @@ final class BoostController: ObservableObject {
         case .alwaysDocked:
             removeEventMonitor()
             stopBurstWorkItem?.cancel()
+            let wasBoosting = isBoosting
             startBoost(status: "Boosting continuously while docked")
-        case .whileDocked:
-            removeEventMonitor()
-            stopBurstWorkItem?.cancel()
-            startBoost(status: "All-motion test — returns to On activity after 60 seconds")
+            if periodic && wasBoosting { updateReadout() }
         case .onScroll, .onInteraction, .whileInUse:
             installEventMonitor()
             if let engineError {
@@ -1065,20 +1194,22 @@ final class BoostController: ObservableObject {
             if !periodic {
                 stopBurstWorkItem?.cancel()
                 stopBoost(status: waitingStatus)
-            } else if !isBoosting && currentStatus != waitingStatus {
+            } else if isBoosting {
+                updateReadout()
+            } else if currentStatus != waitingStatus {
                 currentStatus = waitingStatus
                 if indicatorSettleWorkItem == nil { showCurrentState() }
             }
         }
     }
 
-    private func canBoost(displays: [DisplayInfo]) -> Bool {
+    private func canBoost() -> Bool {
         guard engineError == nil, engine != nil else {
             stopBoost(status: engineError ?? "Metal is unavailable.")
             return false
         }
 
-        if let reason = environment(displays: displays).pauseReason {
+        if let reason = environment.pauseReason {
             suspend(status: reason)
             return false
         }
@@ -1086,20 +1217,22 @@ final class BoostController: ObservableObject {
         return true
     }
 
-    private func environment(displays: [DisplayInfo]) -> BoostEnvironment {
+    private var environment: BoostEnvironment {
         BoostEnvironment(
             mode: mode,
             screensAreAwake: screensAreAwake,
             screenIsLocked: screenIsLocked,
-            usingACPower: isUsingACPower(),
+            usingACPower: usingACPower,
             thermalState: ProcessInfo.processInfo.thermalState,
             hasTargetDisplay: displays.contains(where: \.isTarget)
         )
     }
 
-    private func isUsingACPower() -> Bool {
-        // This public IOKit call returns nil when no external adapter is connected.
-        IOPSCopyExternalPowerAdapterDetails()?.takeRetainedValue() != nil
+    /// Mains power on a desktop Mac as well as a laptop with its adapter
+    /// connected. Anything else, including a failed read, counts as battery.
+    private static func isUsingACPower() -> Bool {
+        guard let source = IOPSGetProvidingPowerSourceType(nil)?.takeUnretainedValue() else { return false }
+        return (source as String) == kIOPMACPowerKey
     }
 
     /// `burst` marks activity-triggered boosts. While the menu bar already
@@ -1113,7 +1246,13 @@ final class BoostController: ObservableObject {
         if !isBoosting || currentStatus != status {
             diagnostic(status)
         }
-        engine.start(strength: strength)
+        // The readout covers boosted time only, so its window opens here.
+        if !isBoosting {
+            clockMonitor?.mark()
+            readoutWindowStart = ProcessInfo.processInfo.systemUptime
+        }
+        setBoostActivity(true)
+        engine.start()
         isBoosting = true
         currentStatus = status
         if burst && showsBoosting {
@@ -1131,8 +1270,11 @@ final class BoostController: ObservableObject {
     private func stopBoost(status: String, linger: Bool = false) {
         if isBoosting {
             diagnostic("Stopped: \(status)")
+            // The last reading of a burst, shown while the indicator lingers.
+            if linger { updateReadout(final: true) }
         }
         engine?.stop()
+        setBoostActivity(false)
         isBoosting = false
         currentStatus = status
         guard linger && showsBoosting else {
@@ -1155,7 +1297,63 @@ final class BoostController: ObservableObject {
         indicatorSettleWorkItem = nil
         if showsBoosting != isBoosting { showsBoosting = isBoosting }
         if statusText != currentStatus { statusText = currentStatus }
-        if !isBoosting && !timingText.isEmpty { timingText = "" }
+        if !isBoosting && !readoutText.isEmpty { readoutText = "" }
+    }
+
+    /// Called on the 2-second timer while boosting and at the end of a burst.
+    /// A steady hold always produces the same text, so it publishes once.
+    /// Power, thermal and lock notifications also reach here at any moment,
+    /// so a window under a second is left to grow unless the burst is over.
+    private func updateReadout(final: Bool = false) {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard final || now - readoutWindowStart >= 1 else { return }
+        let window = now - readoutWindowStart
+        readoutWindowStart = now
+        let loop = engine?.takeLoopSample()
+        let clock = clockMonitor?.read()
+        if let clock {
+            sessionSeconds += window
+            sessionHeldSeconds += window * clock.heldShare
+        }
+        let session = sessionSeconds >= 60 ? sessionHeldSeconds / sessionSeconds : nil
+        if let text = Self.readout(clock: clock, loop: loop, session: session), readoutText != text {
+            readoutText = text
+        }
+        guard diagnosticsEnabled else { return }
+        var parts: [String] = []
+        if let clock {
+            let rate = clock.megahertz.map { " at \($0) MHz" } ?? " in the top state"
+            parts.append(String(format: "GPUPH %.1f%%", clock.mainShare * 100)
+                + (clock.secondShare.map { String(format: ", AFRSTATE %.1f%%", $0 * 100) } ?? "") + rate)
+        }
+        if let loop {
+            parts.append(String(format: "%.0f batches/s, %.1f µs GPU each",
+                                loop.batchesPerSecond, loop.gpuMicrosecondsPerBatch))
+        }
+        if let session { parts.append(String(format: "%.2f%% over %.0f s boosted", session * 100, sessionSeconds)) }
+        if !parts.isEmpty { diagnostic("Clock: " + parts.joined(separator: "; ")) }
+    }
+
+    /// `session` is the share of all boosted time at the top state. It is
+    /// shown once there is a minute of it, so one slow window stays visible
+    /// after the current reading has recovered.
+    fileprivate static func readout(clock: GPUClockMonitor.Reading?, loop: LoopSample?,
+                                    session: Double? = nil) -> String? {
+        if let clock {
+            let rate = clock.megahertz.map { "\($0) MHz" } ?? "its top speed"
+            // Rounded down, so 100% means no measurable time below the top state.
+            let overall = session.map { String(format: " (%.1f%% this session)", ($0 * 1_000).rounded(.down) / 10) } ?? ""
+            // Short dips are normal; only say so when the hold is really short.
+            if clock.heldShare >= 0.97 { return "GPU clock held at \(rate)\(overall)" }
+            return String(format: "GPU clock at \(rate) %.0f%% of the time", clock.heldShare * 100) + overall
+        }
+        if let loop {
+            let thousands = (loop.batchesPerSecond / 1_000).rounded()
+            return thousands >= 1
+                ? String(format: "Submitting about %.0f,000 GPU batches a second", thousands)
+                : String(format: "Submitting %.0f GPU batches a second", loop.batchesPerSecond)
+        }
+        return nil
     }
 
     private func diagnostic(_ message: String) {
@@ -1180,22 +1378,23 @@ final class BoostController: ObservableObject {
                 name: screen.localizedName,
                 pixelWidth: displayMode.pixelWidth,
                 pixelHeight: displayMode.pixelHeight,
-                refreshRate: displayMode.refreshRate
+                refreshRate: displayMode.refreshRate,
+                maximumFramesPerSecond: screen.maximumFramesPerSecond
             )
         }
     }
 
-    private func display(at point: NSPoint, from infos: [DisplayInfo]) -> DisplayInfo? {
+    private func display(at point: NSPoint) -> DisplayInfo? {
         guard let screen = NSScreen.screens.first(where: { NSMouseInRect(point, $0.frame, false) }),
               let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
             return nil
         }
 
         let id = CGDirectDisplayID(number.uint32Value)
-        return infos.first(where: { $0.id == id })
+        return displays.first(where: { $0.id == id })
     }
 
-    private func updateDisplayText(from displays: [DisplayInfo]) {
+    private func updateDisplayText() {
         let text: String
         if let target = displays.first(where: \.isTarget) {
             text = target.summary
@@ -1213,8 +1412,8 @@ private struct BoostMenu: View {
         Text("M5GPUBoost \(BoostController.appVersion)").font(.caption).foregroundStyle(.secondary)
         Text(controller.displayText)
         Text(controller.statusText)
-        if !controller.timingText.isEmpty {
-            Text(controller.timingText)
+        if !controller.readoutText.isEmpty {
+            Text(controller.readoutText)
         }
 
         Divider()
@@ -1222,12 +1421,6 @@ private struct BoostMenu: View {
         Picker("Mode", selection: $controller.mode) {
             ForEach(BoostMode.allCases) { mode in
                 Text(mode.label).tag(mode)
-            }
-        }
-
-        Picker("Strength", selection: $controller.strength) {
-            ForEach(BoostStrength.allCases) { strength in
-                Text(strength.label).tag(strength)
             }
         }
 

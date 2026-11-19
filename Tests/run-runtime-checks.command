@@ -44,6 +44,13 @@ if [[ "${1:-}" == "--compile-only" ]]; then
     exit 0
 fi
 
+# The checks measure the GPU clock with and without a boost, so a running
+# copy of the app would hold the clock up and fail them.
+if /usr/bin/pgrep -x M5GPUBoost >/dev/null; then
+    echo "M5GPUBoost is running. Quit it first, then run the checks again."
+    exit 1
+fi
+
 # The checks save modes through UserDefaults. As a bare executable they use
 # their own domain, never the app's; remove it afterwards.
 trap '/usr/bin/defaults delete "$binary_name" >/dev/null 2>&1 || true' EXIT

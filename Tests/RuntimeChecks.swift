@@ -2,37 +2,54 @@
 // to Sources/M5GPUBoost.swift, minus its @main app, so the extensions below
 // can reach private state. They run the real Metal engines and controller.
 
-extension LegacyMetalBoostEngine {
+extension OriginalBoostEngine {
     fileprivate func testActive() -> Bool { worker.sync { active } }
+    fileprivate func testSync<T>(_ value: @autoclosure () -> T) -> T { worker.sync { value() } }
+    /// Orphans the work in flight, as if its completions never arrived.
+    fileprivate func testStall() {
+        worker.sync {
+            generation &+= 1
+            lastProgress = DispatchTime.now().uptimeNanoseconds &- 3_000_000_000
+        }
+    }
 }
-extension ReusableBlitEngine {
+extension Metal4BoostEngine {
     fileprivate func testActive() -> Bool { worker.sync { active } }
     fileprivate func testDrained() -> Bool { worker.sync { !lanes.contains(where: { $0.busy }) } }
     fileprivate func testFault() { worker.sync { fail("Synthetic runtime test fault") } }
-    fileprivate func testTelemetryCallbacks(_ value: @autoclosure () -> Int) -> Int { worker.sync { value() } }
+    /// Marks a lane as submitted three seconds ago with no feedback since.
+    fileprivate func testStall() {
+        worker.sync {
+            lanes[0].busy = true
+            lanes[0].submittedAt = DispatchTime.now().uptimeNanoseconds &- 3_000_000_000
+        }
+    }
+    fileprivate func testSync<T>(_ value: @autoclosure () -> T) -> T { worker.sync { value() } }
 }
 extension MetalBoostEngine {
-    fileprivate func testActive() -> Bool { legacy.testActive() || (reusable?.testActive() ?? false) }
-    fileprivate func testReusableAvailable() -> Bool { reusable != nil }
-    fileprivate func testReusableActive() -> Bool { reusable?.testActive() ?? false }
-    fileprivate func testLegacyActive() -> Bool { legacy.testActive() }
+    fileprivate func testActive() -> Bool { (original?.testActive() ?? false) || (metal4?.testActive() ?? false) }
+    fileprivate func testMetal4Available() -> Bool { metal4 != nil }
+    fileprivate func testMetal4Active() -> Bool { metal4?.testActive() ?? false }
+    fileprivate func testOriginalActive() -> Bool { original?.testActive() ?? false }
+    fileprivate func testFaultMetal4() { metal4?.testFault() }
 }
 extension BoostController {
     fileprivate func testResources() -> [Bool] { [engine != nil, interactionMonitor != nil, refreshTimer != nil] }
-    fileprivate func expireDiagnostic() {
-        dockedTestDeadline = ProcessInfo.processInfo.systemUptime - 1
-        reevaluate(periodic: true)
-    }
     /// Stops real input and the polling timer from reaching this controller,
     /// so the timed checks below see only the activity they inject.
     fileprivate func testQuiesce() {
         removeEventMonitor()
         refreshTimer?.invalidate()
         refreshTimer = nil
+        lastInteractionCheck = .infinity
     }
+    /// A power or thermal notification can reinstall the input monitor at any
+    /// moment, so the throttle is also left closed after each injection.
+    /// Real input and app switches then can't extend the burst being timed.
     fileprivate func testActivity(_ activity: BoostActivity, at point: NSPoint) {
         lastInteractionCheck = -Double.infinity
         handleInteraction(activity, at: point)
+        lastInteractionCheck = .infinity
     }
     fileprivate func testEngineActive() -> Bool { engine?.testActive() ?? false }
     fileprivate func testLocked() -> Bool { screenIsLocked }
@@ -42,7 +59,8 @@ extension BoostController {
         if now { reevaluate(periodic: true) }
     }
     fileprivate func testMonitorInstalled() -> Bool { interactionMonitor != nil }
-    fileprivate func testShown() -> (Bool, String, String) { (showsBoosting, statusText, timingText) }
+    fileprivate func testShown() -> (Bool, String, String) { (showsBoosting, statusText, readoutText) }
+    fileprivate static func testACPower() -> Bool { isUsingACPower() }
     /// Centre of the first qualifying display, where injected activity counts.
     fileprivate func testTargetPoint() -> NSPoint? {
         let targets = Set(displayInfos().filter(\.isTarget).map(\.id))
@@ -68,57 +86,136 @@ extension BoostController {
 
         // Engines
         let engine = try MetalBoostEngine()
-        check(engine.testReusableAvailable(), "Metal 4 backend selected on this Mac")
-        engine.start(strength: .gentle)
+        check(engine.testMetal4Available(), "Metal 4 backend selected on this Mac")
+        engine.start()
         Thread.sleep(forTimeInterval: 0.2)
         check(engine.testActive(), "real Metal engine starts")
         Thread.sleep(forTimeInterval: 3.2)
         check(!engine.testActive(), "real Metal engine expires without controller renewal")
-        engine.start(strength: .gentle)
+        engine.start()
         Thread.sleep(forTimeInterval: 0.1)
         check(engine.testActive(), "engine restarts after expiry")
         engine.stop()
         check(!engine.testActive(), "explicit stop ends engine")
 
-        let reusable = try ReusableBlitEngine()
-        var telemetryCallbacks = 0
-        reusable.setTelemetryHandler { _ in telemetryCallbacks += 1 }
-        reusable.start()
-        Thread.sleep(forTimeInterval: 1.8)
-        check(reusable.testTelemetryCallbacks(telemetryCallbacks) >= 2, "feedback continues across reused command buffers")
-        reusable.stop()
-        check(!reusable.testActive(), "reusable engine stops")
-        for _ in 0..<100 { reusable.start(); reusable.stop() }
-        reusable.start()
+        let metal4 = try Metal4BoostEngine()
+        metal4.start()
+        Thread.sleep(forTimeInterval: 1.0)
+        let metal4Loop = metal4.takeLoopSample()
+        check((metal4Loop?.batchesPerSecond ?? 0) > 1_000 && (metal4Loop?.gpuMicrosecondsPerBatch ?? 0) > 0,
+              "feedback continues across reused command buffers")
+        metal4.stop()
+        check(!metal4.testActive(), "Metal 4 engine stops")
+        check(metal4.takeLoopSample() == nil, "a stopped engine reports no loop sample")
+        for _ in 0..<100 { metal4.start(); metal4.stop() }
+        metal4.start()
         Thread.sleep(forTimeInterval: 0.15)
-        check(reusable.testActive(), "rapid stop/restart retains allocator safety and resumes")
-        reusable.stop()
+        check(metal4.testActive(), "rapid stop/restart retains allocator safety and resumes")
+        metal4.stop()
         Thread.sleep(forTimeInterval: 0.05)
-        check(reusable.testDrained(), "all lanes finish and drain after stop")
+        check(metal4.testDrained(), "all lanes finish and drain after stop")
         var observedFailures = 0
-        reusable.setFailureHandler { _ in observedFailures += 1 }
-        reusable.start()
-        reusable.testFault()
-        check(!reusable.testActive() && observedFailures == 1, "synthetic failure stops new submissions and reports once")
-        reusable.stop()
+        metal4.setFailureHandler { _ in observedFailures += 1 }
+        metal4.start()
+        metal4.testFault()
+        check(!metal4.testActive() && metal4.testSync(observedFailures) == 1,
+              "synthetic failure stops new submissions and reports once")
+        metal4.stop()
 
-        let fallback = try MetalBoostEngine(useReusableBlits: false)
-        check(!fallback.testReusableAvailable(), "forced original-backend fallback selected")
-        fallback.start(strength: .gentle)
-        check(fallback.testActive(), "original Gentle fallback starts")
-        fallback.stop()
-        check(!fallback.testActive(), "original fallback stops")
-        engine.start(strength: .gentle)
-        engine.updateStrength(.balanced)
+        let stalled = try Metal4BoostEngine()
+        var stallReports = 0
+        stalled.setFailureHandler { _ in stallReports += 1 }
+        stalled.start()
         Thread.sleep(forTimeInterval: 0.1)
-        check(engine.testLegacyActive(), "Gentle-to-Balanced switches to original engine")
-        engine.updateStrength(.gentle)
+        stalled.stop()
         Thread.sleep(forTimeInterval: 0.1)
-        check(engine.testReusableActive() && !engine.testLegacyActive(), "Balanced-to-Gentle returns to reusable engine")
+        stalled.testStall()
+        stalled.start()
+        check(!stalled.testActive() && stalled.testSync(stallReports) == 1,
+              "a lane with no feedback for 2 seconds is reported at the next start")
+
+        // Runtime fallback
+        check(engine.testMetal4Available(), "router still on Metal 4 before the fault")
+        var notes = 0, terminalFailures = 0
+        engine.setNoteHandler { _ in notes += 1 }
+        engine.setFailureHandler { _ in terminalFailures += 1 }
+        engine.start()
+        Thread.sleep(forTimeInterval: 0.1)
+        engine.testFaultMetal4()
+        spin(0.3)
+        check(!engine.testMetal4Available() && engine.testOriginalActive() && notes == 1 && terminalFailures == 0,
+              "a Metal 4 failure while boosting hands over to the original backend")
+        _ = engine.takeLoopSample()
+        Thread.sleep(forTimeInterval: 1.0)
+        check((engine.takeLoopSample()?.batchesPerSecond ?? 0) > 1_000, "the original backend keeps submitting after the handover")
         engine.stop()
+        check(!engine.testActive(), "stop still ends the engine after the handover")
+
+        let fallback = try MetalBoostEngine(useMetal4: false)
+        check(!fallback.testMetal4Available(), "forced original-backend fallback selected")
+        fallback.start()
+        check(fallback.testActive(), "original backend starts")
+        fallback.stop()
+        check(!fallback.testActive(), "original backend stops")
+
+        let original = try OriginalBoostEngine()
+        var originalFailures = 0
+        original.setFailureHandler { _ in originalFailures += 1 }
+        original.start()
+        Thread.sleep(forTimeInterval: 0.3)
+        original.testStall()
+        Thread.sleep(forTimeInterval: 0.2)
+        _ = original.takeLoopSample()
+        Thread.sleep(forTimeInterval: 0.3)
+        check(original.takeLoopSample() == nil, "orphaned work leaves the original loop stalled")
+        original.start()
+        Thread.sleep(forTimeInterval: 0.5)
+        check((original.takeLoopSample()?.batchesPerSecond ?? 0) > 1_000 && original.testSync(originalFailures) == 0,
+              "the next start restarts stalled lanes on the original backend")
+        Thread.sleep(forTimeInterval: 3.2)
+        check(!original.testActive(), "original backend expires without renewal")
+
+        // GPU clock
+        check(BoostController.readout(clock: .init(mainShare: 0.999, secondShare: 0.98, megahertz: 1620), loop: nil)
+            == "GPU clock held at 1620 MHz", "a full hold reads as held")
+        check(BoostController.readout(clock: .init(mainShare: 1, secondShare: 0.23, megahertz: 1620), loop: nil)
+            == "GPU clock at 1620 MHz 23% of the time", "the readout follows the weaker of the two channels")
+        check(BoostController.readout(clock: .init(mainShare: 1, secondShare: nil, megahertz: nil), loop: nil)
+            == "GPU clock held at its top speed", "the readout works without a second channel or a frequency")
+        check(BoostController.readout(clock: nil, loop: LoopSample(batchesPerSecond: 18_400, gpuMicrosecondsPerBatch: 4))
+            == "Submitting about 18,000 GPU batches a second", "the submission rate is shown where the clock can't be read")
+        check(BoostController.readout(clock: .init(mainShare: 1, secondShare: 1, megahertz: 1620), loop: nil, session: 0.99872)
+            == "GPU clock held at 1620 MHz (99.8% this session)", "the session figure is added once there is a minute of it, rounded down")
+        let metal4Hold = try Metal4BoostEngine()
+        guard let monitor = GPUClockMonitor.shared else { fatalError("FAIL: GPU clock states can't be read on this Mac") }
+        check(true, "GPU clock states can be read on this Mac")
+        for (name, start, stop) in [
+            ("Metal 4", { metal4Hold.start() }, { metal4Hold.stop() }),
+            ("original", { original.start() }, { original.stop() }),
+        ] as [(String, () -> Void, () -> Void)] {
+            start()
+            Thread.sleep(forTimeInterval: 0.5)
+            monitor.mark()
+            for _ in 0..<3 { Thread.sleep(forTimeInterval: 1); start() }
+            let reading = monitor.read()
+            stop()
+            print(String(format: "      %@: GPUPH %.1f%%, AFRSTATE %.1f%% in the top state",
+                         name, (reading?.mainShare ?? 0) * 100, (reading?.secondShare ?? 0) * 100))
+            // Run from a terminal, this process is deprioritised whenever the
+            // terminal's app isn't in front, which lowers both channels
+            // together. What must never happen is the second one trailing
+            // the first, as it did with the four-byte fill.
+            let main = reading?.mainShare ?? 0, second = reading?.secondShare ?? main
+            check(main >= 0.5 && second >= main - 0.1, "the \(name) backend holds the second GPU clock channel as well as the first")
+        }
+        Thread.sleep(forTimeInterval: 1.0)
+        monitor.mark()
+        Thread.sleep(forTimeInterval: 1.0)
+        check((monitor.read()?.heldShare ?? 1) < 0.5, "the clock falls again once the work stops")
 
         // Controller lifecycle
         _ = NSApplication.shared
+        check(BoostController.testACPower(), "mains power is detected")
         let controller = BoostController()
         check(controller.hasTargetDisplay, "a qualifying external display is connected")
         check(controller.testResources() == [true, true, true], "eligible display creates engine/input/timer")
@@ -131,11 +228,8 @@ extension BoostController {
         check(controller.testResources() == [false, false, false], "Off releases resources")
         controller.mode = .onInteraction
         check(controller.testResources() == [true, true, true], "activity mode resumes resources")
-        controller.mode = .whileDocked
-        check(controller.isBoosting, "bounded diagnostic starts")
-        check(UserDefaults.standard.string(forKey: "boostMode") == "on_interaction", "bounded diagnostic never saved as login mode")
-        controller.expireDiagnostic()
-        check(controller.mode == .onInteraction && !controller.isBoosting, "expired diagnostic returns to idle activity mode")
+        check(BoostMode.restored(from: "while_docked") == .onInteraction && BoostMode.restored(from: "Continuous") == .onInteraction,
+              "retired always-on modes are restored as On activity")
 
         // Menu-bar indicator coalescing
         guard let point = controller.testTargetPoint() else {
@@ -151,21 +245,22 @@ extension BoostController {
             && controller.testShown().1 == "Boosting while scrolling", "burst starts and is shown at once")
         check(publishes == 2, "burst start publishes once per shown value")
         NotificationCenter.default.post(name: ProcessInfo.thermalStateDidChangeNotification, object: nil)
-        check(controller.isBoosting, "harmless thermal change does not cut a burst short")
+        check(controller.isBoosting && publishes == 2, "harmless thermal change does not cut a burst short or publish")
         controller.testQuiesce()
         spin(1.3)
         check(!controller.isBoosting, "GPU work still stops 0.9 seconds after the last activity")
         check(controller.testShown().0 && controller.testShown().1 == "Boosting while scrolling",
               "indicator lingers after the burst ends")
         let afterFirstBurst = publishes
-        check(afterFirstBurst <= 3, "nothing but batch timing published during or after the first burst")
+        check(afterFirstBurst == 3 && !controller.testShown().2.isEmpty, "the burst's clock readout is the only other publish")
+        print("      \(controller.testShown().2)")
         controller.testActivity(.scroll, at: point)
         check(controller.isBoosting && publishes == afterFirstBurst, "a burst during the linger publishes nothing")
         spin(0.9 + 3.4)
         check(!controller.isBoosting && !controller.testShown().0
             && controller.testShown().1 == "Ready — waiting for scrolling"
             && controller.testShown().2.isEmpty, "indicator settles to idle after the hold")
-        check(publishes <= 6, "two bursts publish at most 6 changes")
+        check(publishes <= 7, "two bursts publish at most 7 changes")
         controller.mode = .onInteraction
         controller.testQuiesce()
         controller.testActivity(.scroll, at: point)
@@ -216,8 +311,11 @@ extension BoostController {
             && BoostMode.restored(from: "always_docked") == .alwaysDocked, "Always while docked is saved and restored")
         spin(4.5)
         check(controller.isBoosting && controller.testEngineActive(), "continuous boost outlives the 3-second lease")
+        print("      \(controller.testShown().2)")
+        check(controller.testShown().2.hasPrefix("GPU clock "), "the menu reports the GPU clock in Always while docked")
         NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.screensDidSleepNotification, object: nil)
         check(!controller.isBoosting && controller.testResources() == [false, false, false], "display sleep stops the continuous boost")
+        check(controller.testShown().2.isEmpty, "the readout clears when the boost is paused")
         NSWorkspace.shared.notificationCenter.post(name: NSWorkspace.screensDidWakeNotification, object: nil)
         check(controller.isBoosting, "wake resumes the continuous boost")
         controller.mode = .onInteraction
@@ -256,6 +354,11 @@ extension BoostController {
               "a 5120×2160 120 Hz external display qualifies")
         check(!DisplayInfo(id: 3, isBuiltin: false, name: "Ultrawide", pixelWidth: 5120, pixelHeight: 2160, refreshRate: 60).isTarget,
               "the same display at 60 Hz does not")
+        check(DisplayInfo(id: 4, isBuiltin: false, name: "Ultrawide", pixelWidth: 5120, pixelHeight: 2160, refreshRate: 0,
+                          maximumFramesPerSecond: 120).isTarget
+            && !DisplayInfo(id: 5, isBuiltin: false, name: "Ultrawide", pixelWidth: 5120, pixelHeight: 2160, refreshRate: 0,
+                            maximumFramesPerSecond: 60).isTarget,
+              "an adaptive mode reporting 0 Hz qualifies by the screen's fastest refresh")
         controller.mode = .off
         print("RUNTIME_CHECKS: \(count) passed")
     }
